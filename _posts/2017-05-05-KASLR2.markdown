@@ -1,0 +1,240 @@
+---
+layout: post
+title:  "Finding the needle in the haystack"
+date:   2017-05-05 11:15:34 +0200
+categories: volatility kaslr
+---
+As described in the [previous post]({{ site.baseurl }}{% post_url 2017-04-26-KASLR1 %}) due to changes in how Linux KASLR works I had some problems making Volatility work with recent memory dumps.
+
+In this post I'll cover how I tried to solve this problem and go over possible approaches.
+
+My situation: I have a Linux memory dump and a valid, matching Volatility profile. I want to e.g. find out which processes were running at the time the dump was acquired.
+
+In general to get the information I want I need to take these steps:
+
+1. Determine the kernel DTB
+1. Determine the virtual address of `init_task`
+1. Determine the size of `task_struct` (included in dwarf file)
+1. Use this VA and the DTB to determine the physical address of `init_task`
+1. From that physical address read a portion of `task_structs` size (easy once we have the PA)
+1. Determine the offset of the `tasks` member in `task_struct` (included in dwarf file)
+1. Read that offset from the portion we extracted to enter the double linked list
+1. Walk that list in one direction until we return at `init_task` again 
+
+Let's have look at the changes KASLR introduces to physical and virtual memory and how each scenario changes the way how we can determine DTB and the VA of `init_task`:
+
+![KASLR](/images/kaslr.gif)
+
+Without KASLR
+-------------
+
+![nokaslr](/images/nokaslr.jpg)
+
+Due to kernel identity paging this is easy. We only need to calculate the kernel DTB with data included in `System.map` and the dwarf file, the VA of `init_task` can just be read from `System.map`.
+
+To calculate the DTB:
+1. Read VA of symbol `init_level4_pgt`
+1. Subtract a known identity paging offset (in my case 0xffffffff80000000)
+1. ???
+1. Profit!
+
+With pre-4.8 KASLR
+------------------
+
+![oldkaslr](/images/kaslr1.jpg)
+
+Things are a little trickier here, since both the physical and the virtual addresses are now shifted by an unknown random offset `r`. But once we found `r`, determining the DTB and the VA of `init_task` are trivial again.
+
+To find `r`:
+1. Locate a known string, `swapper/0` followed by a bunch of zero bytes, in physical memory
+1. Determine the expected location of that string by 
+   1. Looking up the VA of the symbol of `init_task`
+   1. Determine the offset of the `comm` member in `task_struct` from the dwarf file
+   1. Adding that offset to the VA of `init_task`
+   1. Subtract a known identity paging offset (in my case 0xffffffff80000000)
+1. `r = pa(location_found) - pa(location_expected)`
+
+Once we have `r` we can determine the DTB:
+1. Read VA of symbol `init_level4_pgt`
+1. Add `r`
+1. Subtract a known identity paging offset (in my case 0xffffffff80000000)
+1. ???
+1. Profit!
+
+To determine the VA of `init_task`:
+1. Read VA of symbol `init_task`
+1. Add `r`
+
+So since physical shift and virtual shift are identical we can basically just `grep` for a known string in the memdump to derive all required information. This was already supported by Volatility and `r` would be stored as a run time parameter for the profile, so that all subsequent kernel symbol lookups are also adding `r` to the addresses found in `System.map`. Note that it is possible that we might find several matches for `swapper/0` and accompanying constraints, so we might need to look at several possible DTB/`r` combinations.
+
+With 4.8 and later KASLR
+------------------------
+
+![newkaslr](/images/kaslr2.jpg)
+
+If the image we need to analyze was taken on a host running kernel 4.8 or later with KASLR enabled we need to determine two distinct random values, the physical KASLR shift `p` and the virtual KASLR shift `v`.
+We can use the method that was used to determine `r` from the pre-4.8 KASLR code to determine `p` and the DTB (using `p` instead of `r`), but this does not automatically reveal `v` to us. 
+
+Unfortunately there is no kernel symbol called `kaslr_virtual_shift` which - by adding the distance of that symbol from `init_task` to the known physical address of `init_task` - would just return this value. Of course if the machine has not been turned off since the memory dump was acquired we could just read its `/proc/kallsyms` which contain the run time VAs of kernel and module symbols and from which we could just subtract the VA found in `System.map`:
+
+{% highlight bash %}
+$ grep init_task /proc/kallsyms
+ffffffff853303d0 T ftrace_graph_init_task
+ffffffff85372730 T perf_event_init_task
+ffffffff85c7de00 r __ksymtab_init_task
+ffffffff85c97558 r __kcrctab_init_task
+ffffffff85ca23e6 r __kstrtab_init_task
+ffffffff85e00000 D __start_init_task
+ffffffff85e04000 D __end_init_task
+ffffffff85e0e500 D init_task
+ffffffffc04ee558 b ext4_lazyinit_task   [ext4]
+$ grep init_task /boot/System.map
+ffffffff811303d0 T ftrace_graph_init_task
+ffffffff81172730 T perf_event_init_task
+ffffffff81a7de00 r __ksymtab_init_task
+ffffffff81a97558 r __kcrctab_init_task
+ffffffff81aa23e6 r __kstrtab_init_task
+ffffffff81c00000 D __start_init_task
+ffffffff81c04000 D __end_init_task
+ffffffff81c0e500 D init_task
+$ python -c "print hex(0xffffffff85e0e500 - 0xffffffff81c0e500)"
+0x4200000
+$ echo Profit
+{% endhighlight %}
+
+But we are not always in such a fortunate position, so how can we determine `v` if we can't retrieve this value from the running system?
+
+Do you bruteforce and if so how much?
+-------------------------------------
+
+Of course there is the brute force method. In the previous post I described how paging on amd64 works, so now that we know the physical address of `init_task` we could scan the memory dump for page table entries pointing to that physical address and remember all candidates for the appropriate page tables as `pt_candidates`.
+Then we could again scan the whole dump for possible page directory entries that contain the physical base of our page table candidates, and store them as `pmd_candidates`.
+We could repeat this process for all `pmd_candidates` to retrieve the `pud_candidates`, and hope that our DTB page links to one of those.
+
+This approach should work just fine but it has a few shortcomings:
+
+1. Even if you only find one entry for each of `pt_candidates`, `pmd_candidates`, `pud_candidates` and `pgd_candidates` we need to read the _entire_ dump 4 times
+1. If you're unlucky you might find e.g. 10 `pt_candidates` and for each of those you find 10 `pmd_candidates` and for each of those you find 10 `pud_candidates` and for each stage of memory translation the last candidate we look at was the correct one we need to read the dump 1000 time. Yay.
+
+So even though I'm all for bruteforcing, I dismissed this approach pretty soon. It just doesn't scale well with larger memory images.
+
+Fortunately we already have one (or possibly more) DTB candidates and from the kernel DTB all mapped memory regions should be reachable. That can be used to build a list of all PUDs that can be hopped to from the PGD, and for each of those build a list of reachable PMDs, and finally get a list of all page tables that are available from our DTB. And one of these page tables should point to the physical address of `init_task`. So let's build a tree out of this list:
+
+{% highlight python %}
+'''
+The nested dictionary will look like this:
+PML4 ind | PDPT Ind | PD Ind | PT Ind | PA of page
+{   279: {    91: {   0: {   0: '0x8000000000000163L',
+                             1: '0x8000000000001163L',
+                             ...
+                         },
+                      2: {   15: ....
+                         }
+             123: ...
+         },
+    511: { ...
+         }
+}
+'''
+tree = aspace.get_nonzero_entries(aspace, dtb)
+
+for pml4index, pdpt in tree.items():
+  # Walk the pointertables
+  pointertable = aspace.get_nonzero_entries(aspace, pdpt)
+
+  # If the pointer table has no nonzero entries, it is
+  # irrelevant for our key and we can delete the
+  # pml4 entry (pdpt) from the tree
+  if not pointertable:
+    del tree[pml4index]
+    continue
+
+    # Walk the page directories
+    for pdptindex, pd in pointertable.items():
+         directory = aspace.get_nonzero_entries(aspace, pd)
+
+    if not directory:
+      del pointertable[pdptindex]
+      continue
+      # Walk the page tables
+      for pdindex, pt in directory.items():
+      table = aspace.get_nonzero_entries(aspace, pt)
+       if not pt:
+         del directory[pdindex]
+         continue
+         for ind, tableentry in table.items():
+           try:
+               table[ind] = hex(tableentry)
+           except TypeError:
+               debug.debug("Miss!")
+ 
+      directory[pdindex] = table
+
+    pointertable[pdptindex] = directory
+
+  tree[pml4index] = pointertable
+ return tree
+{% endhighlight %}
+
+`get_nonzero_entries` will ignore all directory/table entries that are
+1. either all zeroes
+1. or marked as large pages (since these are irrelevant for our use case)
+
+This dramatically reduces search space.
+Once we have such a tree for each possible DTB we can search it for leafs that contain an address pointing to the `init_task` physical address for the DTB we are looking at.
+Remember that addresses in these tables are stored in little endian, thus if we are looking for address `0x1a60e500` it will look like `0x00e5601a` in memory. However the conversion
+is already handled by `get_nonzero_pages`.
+
+Also, I am not really interested in the page table that holds the address we are looking for, but rather the indices used in each translation step starting from the DTB.
+So when searching for the page table containing a pointer to `0x8000000000001163` in the example tree in above code snippet I want a result of "Took index 279 in PGD, index 91 in PUD, index 0 in PMD and index 1 in PT", since this is what really matters when determining the virtual KASLR shift. To compare them to the expected indices, I look at the VA of `init_task` in `System.map` and figure out the indices in each translation step (for more details c.f. the memory translation stuff in the previous post). Once I have both sets of indices I can calculate the virtual shift:
+
+{% highlight python %}
+def build_virtual_shift(self, expected, real):
+    # Bits [11:0] are the offset within the final page
+    pageoffset = "000000000000"
+
+    # For all indices in the 4 levels of tables,
+    # calculate the difference between what is observed
+    # and what is expected
+    pt_diff = real[3] - expected[3]
+    if pt_diff < 0:
+        carry = 1
+    else:
+        carry = 0
+
+    pd_diff = real[2] - expected[2] - carry
+    if pd_diff < 0:
+        carry = 1
+    else:
+        carry = 0
+
+    pdptdiff = real[1] - expected[1] - carry
+    if pd_diff < 0:
+        carry = 1
+    else:
+        carry = 0
+
+    pml4diff = real[0] - expected[0] - carry
+
+    vshift = ''
+    for diff in [pml4diff, pdptdiff, pd_diff, pt_diff]:
+        vshift = vshift + self.format_index_binary(diff % 512)
+
+    # This is the virtual shift due to KASLR encoded as bitstring
+    vshift = vshift + pageoffset
+    return vshift
+
+{% endhighlight %}
+
+Profit?
+-------
+
+Now that I was able to calculate `p` and `v` that got me thinking. The real physical shift I am looking for is indeed not `p` but `p - v`, let's call it `p'`. `p` can be thought of as more of a total shift.
+
+Next steps
+----------
+
+To really profit from my cosplay as MMU and Linux KASLR derandomizer it is mandatory to make my code and pseudocode play well with Volatility.
+I was originally going for a plugin only way, but it turned out that some changes to the Linux overlay were required. 
+Even though I am not that used to Python
+I also went for some monkey patching. More on authoring a Volatility plugin and my Python adventures in the next post.
