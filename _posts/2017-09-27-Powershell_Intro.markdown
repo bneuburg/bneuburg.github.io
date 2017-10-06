@@ -81,7 +81,7 @@ To make sure we are on the same page here is some terminology that will pop up w
 - Member: See next section
 - Modules: As in other programming languages modules are used to package and namespace a certain functionality. In Powershell installing and loading additional modules means that you have more Cmdlets available. Modules can either be appropriately assembled binaries or scripts with a `.psm1` suffix. In older versions of Powershells before the module style was en vogue the term for module like packages was SnapIn.
 - Objects: Powershell Cmdlets work on .NET objects, thus they consume and produce objects (as in object oriented programming).
-- Package management: This term describes a symbiosis of Linux distribution package management (e.g. apt/dpkg) and library management for scripting languages (rubygems, CPAN, pipi) and can be used to either install Powershell modules or use Powershell code to install applications or setup services.
+- Package management: This term describes a symbiosis of Linux distribution package management (e.g. apt/dpkg) and library management for scripting languages (rubygems, CPAN, pip) and can be used to either install Powershell modules or use Powershell code to install applications or setup services.
 - Providers: To accommodate the Unix philosophy of "everything is a file" Powershell providers are used to present arbitrary data sources as files or directories (e.g. local certificate store, registry). Besides the built in providers you can create your own. The resulting "directories" presenting the data are called drives.
 - Script: A script is a plaintext file - usually with a `.ps1` suffix - that contains Powershell instructions
 
