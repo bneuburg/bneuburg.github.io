@@ -247,4 +247,4 @@ PS C:\> Get-Service -Name "net*" |
 
 I guess that's a lot to digest, hopefully I'll be able to follow this up soon and walk you through some levels of [Under The Wire][utw] (which by the way provides a sandboxed playground for Powershell that can be accessed via ssh).
 
-[utw]: https://www.underthewire.tech
+[utw]: http://www.underthewire.tech
